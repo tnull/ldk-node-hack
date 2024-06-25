@@ -43,7 +43,8 @@ use lightning_persister::fs_store::FilesystemStore;
 use lightning_transaction_sync::EsploraSyncClient;
 
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
-use lightning_liquidity::{LiquidityClientConfig, LiquidityManager};
+use lightning_liquidity::lsps2::service::LSPS2ServiceConfig;
+use lightning_liquidity::{LiquidityClientConfig, LiquidityManager, LiquidityServiceConfig};
 
 #[cfg(any(vss, vss_test))]
 use crate::io::vss_store::VssStore;
@@ -96,6 +97,17 @@ struct LiquiditySourceConfig {
 impl Default for LiquiditySourceConfig {
 	fn default() -> Self {
 		Self { lsps2_service: None }
+	}
+}
+
+#[derive(Debug, Clone)]
+struct LiquidityProviderConfig {
+	promise_secret: Option<[u8; 32]>,
+}
+
+impl Default for LiquidityProviderConfig {
+	fn default() -> Self {
+		Self { promise_secret: None }
 	}
 }
 
@@ -172,6 +184,7 @@ pub struct NodeBuilder {
 	chain_data_source_config: Option<ChainDataSourceConfig>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
+	liquidity_provider_config: Option<LiquidityProviderConfig>,
 }
 
 impl NodeBuilder {
@@ -187,12 +200,14 @@ impl NodeBuilder {
 		let chain_data_source_config = None;
 		let gossip_source_config = None;
 		let liquidity_source_config = None;
+		let liquidity_provider_config = None;
 		Self {
 			config,
 			entropy_source_config,
 			chain_data_source_config,
 			gossip_source_config,
 			liquidity_source_config,
+			liquidity_provider_config,
 		}
 	}
 
@@ -263,6 +278,14 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps2_service = Some((address, node_id, token));
+		self
+	}
+
+	/// Configures the [`Node`] instance to act as a liquidity provider.
+	pub fn set_liquidity_provider_lsps2(&mut self, promise_secret: [u8; 32]) -> &mut Self {
+		let liquidity_provider_config =
+			self.liquidity_provider_config.get_or_insert(LiquidityProviderConfig::default());
+		liquidity_provider_config.promise_secret = Some(promise_secret);
 		self
 	}
 
@@ -389,6 +412,7 @@ impl NodeBuilder {
 			seed_bytes,
 			logger,
 			kv_store,
+			self.liquidity_provider_config.as_ref(),
 		)
 	}
 }
@@ -523,6 +547,7 @@ fn build_with_store_internal(
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, seed_bytes: [u8; 64],
 	logger: Arc<FilesystemLogger>, kv_store: Arc<DynStore>,
+	liquidity_provider_config: Option<&LiquidityProviderConfig>,
 ) -> Result<Node, BuildError> {
 	// Initialize the on-chain wallet and chain access
 	let xprv = bitcoin::bip32::ExtendedPrivKey::new_master(config.network.into(), &seed_bytes)
@@ -703,6 +728,10 @@ fn build_with_store_internal(
 			100;
 	}
 
+	if liquidity_provider_config.is_some() {
+		user_config.accept_intercept_htlcs = true;
+	}
+
 	// Initialize the ChannelManager
 	let channel_manager = {
 		if let Ok(res) = kv_store.read(
@@ -817,7 +846,7 @@ fn build_with_store_internal(
 		},
 	};
 
-	let liquidity_source = liquidity_source_config.as_ref().and_then(|lsc| {
+	let mut liquidity_source = liquidity_source_config.as_ref().and_then(|lsc| {
 		lsc.lsps2_service.as_ref().map(|(address, node_id, token)| {
 			let lsps2_client_config = Some(LSPS2ClientConfig {});
 			let liquidity_client_config = Some(LiquidityClientConfig { lsps2_client_config });
@@ -841,6 +870,28 @@ fn build_with_store_internal(
 			))
 		})
 	});
+
+	if let Some(liquidity_provider_config) = liquidity_provider_config {
+		let promise_secret = liquidity_provider_config.promise_secret.unwrap_or_default();
+		let liquidity_manager = Arc::new(LiquidityManager::new(
+			Arc::clone(&keys_manager),
+			Arc::clone(&channel_manager),
+			Some(Arc::clone(&tx_sync)),
+			None,
+			Some(LiquidityServiceConfig {
+				lsps2_service_config: Some(LSPS2ServiceConfig { promise_secret }),
+				advertise_service: true,
+			}),
+			None,
+		));
+		liquidity_source = Some(Arc::new(LiquiditySource::new_lsps2_provider(
+			Arc::clone(&channel_manager),
+			Arc::clone(&keys_manager),
+			liquidity_manager,
+			Arc::clone(&config),
+			Arc::clone(&logger),
+		)));
+	}
 
 	let custom_message_handler = if let Some(liquidity_source) = liquidity_source.as_ref() {
 		Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)))
