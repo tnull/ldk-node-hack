@@ -102,6 +102,7 @@ pub use bip39;
 pub use bitcoin;
 pub use lightning;
 pub use lightning_invoice;
+pub use lightning_persister;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 pub use config::{default_config, AnchorChannelsConfig, Config};
@@ -709,6 +710,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
+			self.liquidity_source.clone(),
 		));
 
 		// Setup background processing
