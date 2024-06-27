@@ -1,8 +1,9 @@
 use crate::logger::{log_debug, log_error, log_info, Logger};
-use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager};
+use crate::types::{ChannelManager, FeeEstimator, KeysManager, LiquidityManager, PeerManager};
 use crate::{Config, Error};
 
 use chrono::{DateTime, Utc};
+use lightning::chain::chaininterface::FeeEstimator as FeeEstimatorTrait;
 use lightning::events::HTLCDestination;
 use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::msgs::SocketAddress;
@@ -26,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
+const AVERAGE_OPENING_TX_WEIGHT: f32 = 616.0;
 
 struct LSPS2Service {
 	address: SocketAddress,
@@ -45,6 +47,7 @@ where
 	liquidity_manager: Arc<LiquidityManager>,
 	config: Arc<Config>,
 	logger: L,
+	fee_estimator: Option<Arc<FeeEstimator>>,
 }
 
 impl<L: Deref> LiquiditySource<L>
@@ -65,12 +68,21 @@ where
 			pending_fee_requests,
 			pending_buy_requests,
 		});
-		Self { lsps2_service, channel_manager, keys_manager, liquidity_manager, config, logger }
+		Self {
+			lsps2_service,
+			channel_manager,
+			keys_manager,
+			liquidity_manager,
+			config,
+			logger,
+			fee_estimator: None,
+		}
 	}
 
 	pub(crate) fn new_lsps2_provider(
 		channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
 		liquidity_manager: Arc<LiquidityManager>, config: Arc<Config>, logger: L,
+		fee_estimator: Arc<FeeEstimator>,
 	) -> Self {
 		Self {
 			lsps2_service: None,
@@ -79,6 +91,7 @@ where
 			liquidity_manager,
 			config,
 			logger,
+			fee_estimator: Some(fee_estimator),
 		}
 	}
 
@@ -150,16 +163,34 @@ where
 				counterparty_node_id,
 				token: _,
 			}) => {
+				let config = self
+					.config
+					.lsps2_liquidity_provider_config
+					.as_ref()
+					.cloned()
+					.unwrap_or_default();
 				let service_handler = self.liquidity_manager.lsps2_service_handler().unwrap();
 
-				let min_fee_msat = 0;
-				let proportional = 0;
+				let min_fee_msat = match &self.fee_estimator {
+					Some(fee_estimator) => {
+						let fee_sat_per_1000_weight = fee_estimator.get_est_sat_per_1000_weight(
+							config.funding_tx_fee_multiplier_source_rate,
+						) as u64;
+						let sats_fee = ((fee_sat_per_1000_weight as f32)
+							* (AVERAGE_OPENING_TX_WEIGHT / 1000.0)) as u64;
+						let msats_fee = sats_fee * 1000;
+						core::cmp::max(msats_fee, config.minimum_min_fee_msat)
+					},
+					None => config.minimum_min_fee_msat,
+				};
+
+				let proportional = config.proportional_fee;
 				let mut valid_until: DateTime<Utc> = Utc::now();
-				valid_until += chrono::Duration::minutes(10);
-				let min_lifetime = 1008;
-				let max_client_to_self_delay = 144;
-				let min_payment_size_msat = 1000;
-				let max_payment_size_msat = 10_000_000_000;
+				valid_until += chrono::Duration::minutes(config.fee_valid_for_minutes);
+				let min_lifetime = config.min_lifetime_blocks;
+				let max_client_to_self_delay = config.max_client_to_self_delay_blocks;
+				let min_payment_size_msat = min_fee_msat + config.min_payment_size_buffer_msats;
+				let max_payment_size_msat = config.max_payment_size_msats;
 
 				let opening_fee_params = RawOpeningFeeParams {
 					min_fee_msat,
@@ -191,9 +222,15 @@ where
 				opening_fee_params: _,
 				payment_size_msat: _,
 			}) => {
+				let config = self
+					.config
+					.lsps2_liquidity_provider_config
+					.as_ref()
+					.cloned()
+					.unwrap_or_default();
 				let user_channel_id = 0;
 				let scid = self.channel_manager.get_intercept_scid();
-				let cltv_expiry_delta = 72;
+				let cltv_expiry_delta = config.client_invoice_cltv_expiry_delta;
 				let client_trusts_lsp = true;
 
 				let lsps2_service_handler = self
@@ -215,17 +252,30 @@ where
 			Event::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
 				their_network_key,
 				amt_to_forward_msat,
-				opening_fee_msat: _,
+				opening_fee_msat,
 				user_channel_id,
 				intercept_scid: _,
 			}) => {
-				let channel_size_sats = (amt_to_forward_msat / 1000) * 4;
-				let mut config = *self.channel_manager.get_current_default_configuration();
-				config
+				let config = self
+					.config
+					.lsps2_liquidity_provider_config
+					.as_ref()
+					.cloned()
+					.unwrap_or_default();
+				let payment_size_sats = (amt_to_forward_msat + opening_fee_msat) / 1000;
+				let scaled_payment_size_channel_size =
+					(payment_size_sats as f64 * config.channel_size_factor) as u64;
+				let channel_size_sats =
+					core::cmp::max(config.min_channel_size_sats, scaled_payment_size_channel_size);
+
+				let mut channel_config = *self.channel_manager.get_current_default_configuration();
+				channel_config
 					.channel_handshake_config
 					.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
-				config.channel_config.forwarding_fee_base_msat = 0;
-				config.channel_config.forwarding_fee_proportional_millionths = 0;
+				channel_config.channel_config.forwarding_fee_base_msat =
+					config.forwarding_fee_base_msat;
+				channel_config.channel_config.forwarding_fee_proportional_millionths =
+					config.forwarding_fee_proportional_millionths;
 
 				if let Err(e) = self.channel_manager.create_channel(
 					their_network_key,
@@ -233,7 +283,7 @@ where
 					0,
 					user_channel_id,
 					None,
-					Some(config),
+					Some(channel_config),
 				) {
 					log_error!(self.logger, "Failed to open jit channel: {:?}", e);
 				}

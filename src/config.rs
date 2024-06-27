@@ -7,6 +7,8 @@ use lightning::util::logger::Level as LogLevel;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
 
+use crate::builder::LiquidityProviderConfig;
+
 // Config defaults
 const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node/";
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
@@ -147,6 +149,13 @@ pub struct Config {
 	/// closure. We *will* however still try to get the Anchor spending transactions confirmed
 	/// on-chain with the funds available.
 	pub anchor_channels_config: Option<AnchorChannelsConfig>,
+	/// Configuration options pertaining to providing inbound liquidity to the network using LSPS2 (JIT Channels).
+	///
+	/// Please refer to [`LiquidityProviderConfig`] for further information about the configuration parameters.
+	///
+	/// If set to `Some`, we will advertise ourselves as a liquidity provider to the network.  This means
+	/// we will open channels to users who pay us our desired fees based on this configuration.
+	pub lsps2_liquidity_provider_config: Option<LiquidityProviderConfig>,
 }
 
 impl Default for Config {
@@ -164,6 +173,7 @@ impl Default for Config {
 			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
 			log_level: DEFAULT_LOG_LEVEL,
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
+			lsps2_liquidity_provider_config: None,
 		}
 	}
 }
